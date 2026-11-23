@@ -1,0 +1,54 @@
+id = "wdttg.timer"
+name = "WDTTG Timer"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Auto-track time per herdr workspace into wdttg"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+[[startup]]
+command = ["sh", "scripts/daemon.sh"]
+
+[[actions]]
+id = "pause"
+title = "Pause tracking"
+contexts = ["workspace"]
+command = ["sh", "scripts/pause.sh"]
+
+[[actions]]
+id = "resume"
+title = "Resume tracking"
+contexts = ["workspace"]
+command = ["sh", "scripts/resume.sh"]
+
+[[actions]]
+id = "status"
+title = "Show tracking status"
+contexts = ["workspace"]
+command = ["sh", "scripts/status.sh"]
+
+[[panes]]
+id = "timeline"
+title = "WDTTG Timeline"
+placement = "popup"
+width = "80%"
+height = 20
+command = ["wdttg", "timeline", "today"]
+
+[[panes]]
+id = "review"
+title = "WDTTG Weekly Review"
+placement = "popup"
+width = "80%"
+height = 30
+command = ["wdttg", "review"]
+
+[[panes]]
+id = "quadrant-report"
+title = "Quadrant Report"
+placement = "popup"
+width = "80%"
+height = "20"
+command = ["wdttg", "report", "quadrant", "week"]
