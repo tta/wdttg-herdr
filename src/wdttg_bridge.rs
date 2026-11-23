@@ -26,8 +26,14 @@ impl WdttgBridge {
         self.tasks.rename_task(task_id, new_name)
     }
 
-    pub fn start_session(&self, task_id: i64) -> Result<i64, wdttg::SessionServiceError> {
-        Ok(self.sessions.start(task_id, None)?.id)
+    /// Record a session with a backdated start (used when a workspace is
+    /// recorded after it has been active for >= threshold).
+    pub fn record_session(
+        &self,
+        task_id: i64,
+        start: DateTime<Utc>,
+    ) -> Result<i64, wdttg::SessionServiceError> {
+        Ok(self.sessions.log_session(task_id, start, None, None)?.id)
     }
 
     pub fn close_session(
@@ -49,15 +55,6 @@ impl WdttgBridge {
                 None,
                 None,
             )?;
-        Ok(())
-    }
-
-    pub fn extend_session(
-        &self,
-        session_id: i64,
-        new_end: DateTime<Utc>,
-    ) -> Result<(), wdttg::SessionServiceError> {
-        self.sessions.extend_session(session_id, new_end)?;
         Ok(())
     }
 

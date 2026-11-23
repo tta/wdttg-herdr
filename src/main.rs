@@ -70,6 +70,18 @@ fn main() {
         let want_paused = paused_file.exists();
         if want_paused != tracker.paused {
             tracker.set_paused(want_paused);
+            if want_paused {
+                // Close all recorded sessions at the pause time.
+                let now = Utc::now();
+                for s in tracker.sessions.values() {
+                    if let Some(sid) = s.session_id {
+                        if let Err(e) = bridge.close_session(sid, now) {
+                            tracing::error!("close_session({sid}) on pause failed: {e}");
+                        }
+                    }
+                }
+            }
+            tracker.clear_sessions();
             tracing::info!("tracking {}ed", if want_paused { "paused" } else { "resumed" });
         }
 
@@ -90,13 +102,12 @@ fn main() {
                 // Resolve any pending rename decision before sweeping.
                 check_rename_decision(&bridge, &state_dir, &mut tracker);
 
-                let mut cmds = tracker.sweep(
+                let cmds = tracker.sweep(
                     &workspaces,
                     focused,
                     now,
                     |label, cwd| config.derive_task_name(label, cwd),
                 );
-                cmds.extend(tracker.close_expired(now));
 
                 // Execute commands against wdttg.
                 for cmd in &cmds {
@@ -121,51 +132,40 @@ fn main() {
 
 fn execute_cmd(bridge: &WdttgBridge, tracker: &mut Tracker, cmd: &Cmd, _config: &config::Config) {
     match cmd {
-        Cmd::StartSession { task_name, .. } => {
+        Cmd::RecordSession {
+            workspace_id,
+            task_name,
+            start,
+        } => {
             match bridge.get_or_create_task(task_name) {
-                Ok(task_id) => {
-                    if let Some(ws_id) = find_workspace_by_name(tracker, task_name) {
-                        if let Ok(session_id) = bridge.start_session(task_id) {
-                            if let Some(s) = tracker.sessions.get_mut(&ws_id) {
-                                s.task_id = task_id;
-                                s.session_id = session_id;
-                            }
-                        } else {
-                            tracing::error!("start_session(task={task_id}) failed");
+                Ok(task_id) => match bridge.record_session(task_id, *start) {
+                    Ok(session_id) => {
+                        if let Some(s) = tracker.sessions.get_mut(workspace_id) {
+                            s.task_id = task_id;
+                            s.session_id = Some(session_id);
                         }
                     }
-                }
-                Err(e) => tracing::error!("get_or_create_task({task_name}) failed: {e}"),
-            }
-        }
-        Cmd::BridgeSession { session_id, new_end } => {
-            if let Err(e) = bridge.extend_session(*session_id, *new_end) {
-                tracing::error!("extend_session({session_id}) failed: {e}");
-            }
-        }
-        Cmd::CloseSession { session_id, end_time } => {
-            if let Err(e) = bridge.close_session(*session_id, *end_time) {
-                tracing::error!("close_session({session_id}) failed: {e}");
-            }
-        }
-        Cmd::CloseAndRestart {
-            old_session_id,
-            close_at,
-            task_id,
-        } => {
-            if let Err(e) = bridge.close_session(*old_session_id, *close_at) {
-                tracing::error!("close_session({old_session_id}) failed: {e}");
-            }
-            if *task_id <= 0 {
-                tracing::warn!("CloseAndRestart with sentinel task_id; skipping restart");
-                return;
-            }
-            if let Ok(session_id) = bridge.start_session(*task_id) {
-                for s in tracker.sessions.values_mut() {
-                    if s.session_id == *old_session_id {
-                        s.session_id = session_id;
+                    Err(e) => {
+                        tracing::error!("record_session failed: {e}");
+                        if let Some(s) = tracker.sessions.get_mut(workspace_id) {
+                            s.recorded = false; // retry next sweep
+                        }
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("get_or_create_task({task_name}) failed: {e}");
+                    if let Some(s) = tracker.sessions.get_mut(workspace_id) {
+                        s.recorded = false; // retry next sweep
                     }
                 }
+            }
+        }
+        Cmd::CloseSession {
+            session_id,
+            end_time,
+        } => {
+            if let Err(e) = bridge.close_session(*session_id, *end_time) {
+                tracing::error!("close_session({session_id}) failed: {e}");
             }
         }
         Cmd::RenameTask { task_id, new_name } => {
@@ -174,14 +174,6 @@ fn execute_cmd(bridge: &WdttgBridge, tracker: &mut Tracker, cmd: &Cmd, _config: 
             }
         }
     }
-}
-
-fn find_workspace_by_name(tracker: &Tracker, task_name: &str) -> Option<String> {
-    tracker
-        .sessions
-        .iter()
-        .find(|(_, s)| s.task_name == task_name)
-        .map(|(id, _)| id.clone())
 }
 
 /// Resolve a pending rename prompt by reading a decision file written by a
@@ -199,7 +191,7 @@ fn check_rename_decision(
         };
         if let Some(pr) = tracker.pending_rename.as_ref() {
             let new_name = format!("herdr:{}", pr.new_label);
-            let cmds = tracker.resolve_rename(decision, new_name);
+            let cmds = tracker.resolve_rename(decision, new_name, Utc::now());
             for cmd in &cmds {
                 execute_cmd(bridge, tracker, cmd, &config::Config::default());
             }

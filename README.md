@@ -2,12 +2,19 @@
 
 Herdr plugin that auto-tracks time per workspace into [wdttg](../wdttg).
 
-Each herdr workspace maps to a wdttg task (`herdr:<label>`). When you focus a
-workspace, a session starts on its task. When you leave (to another workspace
-or outside herdr), the session enters a *pending* state. If you return within
-the bridge threshold (default 3 minutes), the session is extended across the
-gap. If you don't return in time, the session closes at the moment you left and
-the gap is untracked.
+Each herdr workspace maps to a wdttg task (`herdr:<label>`). Sessions are
+**not** written to wdttg immediately — the daemon holds them in memory while
+the workspace is focused or briefly blurred (within the bridge threshold). A
+workspace is recorded once it has been active (or bridged) for at least the
+threshold (default 3 minutes). The recorded session is backdated to the start
+of the period.
+
+When you focus a workspace, it is held in memory. When you leave (to another
+workspace or outside herdr), the session enters a *pending* state. If you
+return within the bridge threshold (default 3 minutes), the session extends
+across the gap (bridged). If you don't return in time, the session is closed
+at the moment you left and the gap is untracked. A workspace that is briefly
+visited (under the threshold) never reaches wdttg.
 
 Reports stay in wdttg: `wdttg report`, `wdttg review`, `wdttg trend`.
 
@@ -15,7 +22,8 @@ Reports stay in wdttg: `wdttg report`, `wdttg review`, `wdttg trend`.
 
 - A daemon (`target/release/wdttg-herdr`) polls `herdr api snapshot` every few
   seconds, reads the focused workspace, and drives a per-workspace session
-  state machine.
+  state machine. Workspaces are held in memory and recorded to wdttg only once
+  they have been active for at least the bridge threshold.
 - The daemon talks to wdttg directly via its library (path dependency), writing
   to the same SQLite database the wdttg CLI uses.
 - A tab bar entry shows the current tracked task and elapsed time.
