@@ -50,5 +50,5 @@ id = "quadrant-report"
 title = "Quadrant Report"
 placement = "popup"
 width = "80%"
-height = "20"
+height = 20
 command = ["wdttg", "report", "quadrant", "week"]
