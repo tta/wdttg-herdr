@@ -93,6 +93,32 @@ impl Tracker {
         }
     }
 
+    /// Adopt an already-recorded open session after a daemon restart, so the
+    /// restart is invisible in the data (no close + re-record split).
+    pub fn adopt(
+        &mut self,
+        ws: &WorkspaceInfo,
+        task_id: i64,
+        task_name: String,
+        session_id: i64,
+        start: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) {
+        self.sessions.insert(
+            ws.id.clone(),
+            WorkspaceSession {
+                task_id,
+                task_name,
+                last_seen_label: ws.label.clone(),
+                session_id: Some(session_id),
+                period_start: start,
+                last_focused_at: now,
+                leave_at: None,
+                recorded: true,
+            },
+        );
+    }
+
     pub fn clear_sessions(&mut self) {
         self.sessions.clear();
         self.pending_rename = None;
@@ -574,6 +600,29 @@ mod tests {
         let line = t.status_line(ts(10, 23, 0));
         assert!(line.contains("herdr:a"), "got: {}", line);
         assert!(line.contains("1h 23m"), "got: {}", line);
+    }
+
+    #[test]
+    fn adopted_session_continues_without_split() {
+        let mut t = Tracker::new(TimeDelta::minutes(3), TimeDelta::seconds(60));
+        // Daemon restarts; the open session (started 9:00) is adopted at 9:42.
+        t.adopt(&ws("a", "a"), 1, "herdr:a".to_string(), 10, ts(9, 0, 0), ts(9, 42, 0));
+        // Continued focus: no new RecordSession, and blur-close uses the
+        // adopted session id with the original start.
+        let cmds = t.sweep(&[ws("a", "a")], Some("a"), ts(9, 45, 0), derive);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::RecordSession { .. })),
+            "adopted session must not be re-recorded, got {:?}",
+            cmds
+        );
+        // Blur at 9:46, never return: close at leave time.
+        t.sweep(&[ws("a", "a"), ws("b", "b")], Some("b"), ts(9, 46, 0), derive);
+        let cmds = t.sweep(&[ws("a", "a"), ws("b", "b")], Some("b"), ts(9, 50, 0), derive);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::CloseSession { session_id, end_time } if *session_id == 10 && *end_time == ts(9, 46, 0))),
+            "expected adopted session to close at leave time, got {:?}",
+            cmds
+        );
     }
 
     #[test]

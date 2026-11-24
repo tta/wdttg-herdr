@@ -32,6 +32,7 @@ fn main() {
 
     let status_file = state_dir.join("status.txt");
     let paused_file = state_dir.join("paused");
+    let heartbeat_file = state_dir.join("heartbeat");
 
     let bridge = match WdttgBridge::open() {
         Ok(b) => b,
@@ -41,17 +42,58 @@ fn main() {
         }
     };
 
+    let threshold = chrono::TimeDelta::seconds(config.bridge_threshold_seconds as i64);
+
+    let mut tracker = Tracker::new(
+        threshold,
+        chrono::TimeDelta::seconds(config.rename_timeout_seconds as i64),
+    );
+
+    // Startup: if the previous daemon left a fresh heartbeat and the focused
+    // workspace has an open session, adopt it so the restart doesn't split
+    // the session. Otherwise close orphans at the last heartbeat time (or
+    // now, on first run), bounding them at when tracking actually stopped.
     let now = Utc::now();
-    match bridge.reconcile_orphans(now) {
-        Ok(n) if n > 0 => tracing::info!("reconciled {n} orphaned sessions on startup"),
+    let last_run = std::fs::read_to_string(&heartbeat_file)
+        .ok()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    let mut adopted_id: Option<i64> = None;
+    if let (Some(lr), Some(w)) = (
+        last_run,
+        client_peek_focused(&HerdrClient::new(), &config),
+    ) {
+        if now - lr <= threshold {
+            if let Ok(Some((sid, start, tid))) =
+                bridge.find_open_session_by_task(&w.task_name)
+            {
+                tracing::info!(
+                    "adopting open session {sid} on {} (restart within threshold)",
+                    w.task_name
+                );
+                tracker.adopt(
+                    &WorkspaceInfo {
+                        id: w.id.clone(),
+                        label: w.label.clone(),
+                        cwd: None,
+                    },
+                    tid,
+                    w.task_name.clone(),
+                    sid,
+                    start,
+                    now,
+                );
+                adopted_id = Some(sid);
+            }
+        }
+    }
+    let close_at = last_run.unwrap_or(now);
+    match bridge.reconcile_orphans(close_at, adopted_id) {
+        Ok(n) if n > 0 => tracing::info!("reconciled {n} orphaned sessions at {close_at}"),
         Ok(_) => {}
         Err(e) => tracing::warn!("startup reconciliation failed: {e}"),
     }
 
-    let mut tracker = Tracker::new(
-        chrono::TimeDelta::seconds(config.bridge_threshold_seconds as i64),
-        chrono::TimeDelta::seconds(config.rename_timeout_seconds as i64),
-    );
     // Seed pause state from the flag file.
     tracker.set_paused(paused_file.exists());
 
@@ -136,19 +178,39 @@ fn main() {
             }
         }
 
-        // Write status file for the tab bar.
+        // Write status file for the tab bar, and the heartbeat used to bound
+        // orphaned sessions on the next startup.
         let line = tracker.status_line(Utc::now());
         let tmp = state_dir.join("status.txt.tmp");
         if std::fs::write(&tmp, &line).is_ok() {
             let _ = std::fs::rename(&tmp, &status_file);
         }
+        let _ = std::fs::write(&heartbeat_file, Utc::now().to_rfc3339());
 
         std::thread::sleep(poll_interval);
     }
 }
 
-fn execute_cmd(bridge: &WdttgBridge, tracker: &mut Tracker, cmd: &Cmd, _config: &config::Config) {
-    match cmd {
+/// One-shot poll for the focused workspace, used at startup for adoption.
+struct FocusedWorkspace {
+    id: String,
+    label: String,
+    task_name: String,
+}
+
+fn client_peek_focused(client: &HerdrClient, config: &config::Config) -> Option<FocusedWorkspace> {
+    let snap = client.poll().ok()?;
+    let fw = snap.focused_workspace_id?;
+    let w = snap.workspaces.iter().find(|w| w.id == fw)?;
+    let label = w.label.clone().unwrap_or_default();
+    Some(FocusedWorkspace {
+        id: w.id.clone(),
+        task_name: config.derive_task_name(&label, None),
+        label,
+    })
+}
+
+fn execute_cmd(bridge: &WdttgBridge, tracker: &mut Tracker, cmd: &Cmd, _config: &config::Config) {    match cmd {
         Cmd::RecordSession {
             workspace_id,
             task_name,

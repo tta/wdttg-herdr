@@ -58,9 +58,45 @@ impl WdttgBridge {
         Ok(())
     }
 
+    /// Find an open (end_time IS NULL) session on a task by exact name.
+    /// Returns (session_id, start_time, task_id).
+    pub fn find_open_session_by_task(
+        &self,
+        task_name: &str,
+    ) -> Result<Option<(i64, DateTime<Utc>, i64)>, wdttg::SessionServiceError> {
+        let ids: Vec<i64> = {
+            let conn = self.db.connection();
+            let mut stmt = conn.prepare(
+                "SELECT s.id FROM sessions s
+                 JOIN tasks t ON s.task_id = t.id
+                 WHERE s.end_time IS NULL AND t.name = ?1
+                 ORDER BY s.start_time DESC",
+            )?;
+            let ids = stmt
+                .query_map([&task_name], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            ids
+        };
+
+        let Some(id) = ids.first() else {
+            return Ok(None);
+        };
+        let session = self
+            .sessions
+            .get_by_id(*id)?
+            .ok_or(wdttg::SessionServiceError::NotFound(*id))?;
+        Ok(Some((*id, session.start_time, session.task_id)))
+    }
+
     /// Reconcile on startup: find open sessions (end_time IS NULL) on
-    /// herdr-prefixed tasks and close them at `now`. Returns the count closed.
-    pub fn reconcile_orphans(&self, now: DateTime<Utc>) -> Result<usize, wdttg::SessionServiceError> {
+    /// herdr-prefixed tasks and close them at `close_at` (the last heartbeat
+    /// time, bounding sessions at when tracking actually stopped). Skips
+    /// `except_id` (an adopted session). Returns the count closed.
+    pub fn reconcile_orphans(
+        &self,
+        close_at: DateTime<Utc>,
+        except_id: Option<i64>,
+    ) -> Result<usize, wdttg::SessionServiceError> {
         let ids: Vec<i64> = {
             let conn = self.db.connection();
             let mut stmt = conn.prepare(
@@ -74,9 +110,14 @@ impl WdttgBridge {
             ids
         };
 
+        let mut closed = 0;
         for id in &ids {
-            self.close_session(*id, now)?;
+            if Some(*id) == except_id {
+                continue;
+            }
+            self.close_session(*id, close_at)?;
+            closed += 1;
         }
-        Ok(ids.len())
+        Ok(closed)
     }
 }
