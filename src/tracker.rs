@@ -80,6 +80,19 @@ impl Tracker {
         self.paused = paused;
     }
 
+    /// Called when the daemon detects a wall-clock jump between poll ticks
+    /// (machine suspend/resume). Treats every focused workspace as if the
+    /// user left at `at` (the last tick before the gap), so the normal
+    /// bridge-or-close hysteresis bounds the session instead of spanning the
+    /// suspension.
+    pub fn handle_time_jump(&mut self, at: DateTime<Utc>) {
+        for s in self.sessions.values_mut() {
+            if s.leave_at.is_none() {
+                s.leave_at = Some(at);
+            }
+        }
+    }
+
     pub fn clear_sessions(&mut self) {
         self.sessions.clear();
         self.pending_rename = None;
@@ -569,5 +582,62 @@ mod tests {
         t.set_paused(true);
         let line = t.status_line(ts(9, 0, 0));
         assert!(line.contains("paused"), "got: {}", line);
+    }
+
+    #[test]
+    fn time_jump_causes_close_at_last_tick_not_resume_time() {
+        let mut t = Tracker::new(TimeDelta::minutes(3), TimeDelta::seconds(60));
+        // User works on A 9:00-9:03 (recorded).
+        t.sweep(&[ws("a", "a")], Some("a"), ts(9, 0, 0), derive);
+        t.sweep(&[ws("a", "a")], Some("a"), ts(9, 3, 0), derive);
+        t.sessions.get_mut("a").unwrap().session_id = Some(10);
+        // Machine suspends at 9:05 (last tick), resumes at 17:00.
+        t.sweep(&[ws("a", "a")], Some("a"), ts(9, 5, 0), derive);
+        t.handle_time_jump(ts(9, 5, 0));
+        // After resume, the same workspace is still focused but the gap far
+        // exceeds the threshold: session closes at 9:05, new period at 17:00.
+        let cmds = t.sweep(&[ws("a", "a")], Some("a"), ts(17, 0, 0), derive);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::CloseSession { session_id, end_time } if *session_id == 10 && *end_time == ts(9, 5, 0))),
+            "expected CloseSession at suspend time, got {:?}",
+            cmds
+        );
+        // The new period is unrecorded until it lasts the threshold.
+        assert!(!t.sessions["a"].recorded);
+        assert_eq!(t.sessions["a"].period_start, ts(17, 0, 0));
+    }
+
+    #[test]
+    fn time_jump_within_threshold_after_resume_bridges() {
+        let mut t = Tracker::new(TimeDelta::minutes(3), TimeDelta::seconds(60));
+        t.sweep(&[ws("a", "a")], Some("a"), ts(9, 0, 0), derive);
+        t.sweep(&[ws("a", "a")], Some("a"), ts(9, 3, 0), derive);
+        t.sessions.get_mut("a").unwrap().session_id = Some(10);
+        // Short suspend: last tick 9:05, resume 9:06 (within threshold).
+        t.sweep(&[ws("a", "a")], Some("a"), ts(9, 5, 0), derive);
+        t.handle_time_jump(ts(9, 5, 0));
+        let cmds = t.sweep(&[ws("a", "a")], Some("a"), ts(9, 6, 0), derive);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::CloseSession { .. })),
+            "short suspend should bridge, got {:?}",
+            cmds
+        );
+        assert!(t.sessions["a"].recorded);
+    }
+
+    #[test]
+    fn time_jump_discards_unrecorded_brief_period() {
+        let mut t = Tracker::new(TimeDelta::minutes(3), TimeDelta::seconds(60));
+        // User focuses A at 9:00, suspends at 9:01 (below threshold, unrecorded).
+        t.sweep(&[ws("a", "a")], Some("a"), ts(9, 0, 0), derive);
+        t.handle_time_jump(ts(9, 1, 0));
+        // Resumes at 15:00 on a different workspace.
+        let cmds = t.sweep(&[ws("a", "a"), ws("b", "b")], Some("b"), ts(15, 0, 0), derive);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::RecordSession { task_name, .. } if task_name == "herdr:a")),
+            "brief pre-suspend period must not be recorded, got {:?}",
+            cmds
+        );
+        assert!(!t.sessions.contains_key("a"), "A discarded after expiry");
     }
 }

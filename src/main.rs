@@ -57,6 +57,11 @@ fn main() {
 
     let client = HerdrClient::new();
     let poll_interval = StdDuration::from_secs(config.poll_interval_seconds.max(1));
+    // A wall-clock gap between ticks larger than this means the machine
+    // suspended (or the daemon was frozen); sessions must not span it.
+    let jump_threshold =
+        chrono::TimeDelta::seconds((config.poll_interval_seconds * 10).max(60) as i64);
+    let mut last_tick = Utc::now();
 
     tracing::info!(
         "wdttg-herdr daemon started (bridge={}s, poll={}s, template={})",
@@ -66,6 +71,18 @@ fn main() {
     );
 
     loop {
+        // Detect suspend/resume: if the wall clock jumped far past the sleep
+        // interval, treat the user as having left at the last tick.
+        let tick_now = Utc::now();
+        if tick_now - last_tick > jump_threshold {
+            tracing::info!(
+                "time jump of {}s detected; treating workspaces as left at last tick",
+                (tick_now - last_tick).num_seconds()
+            );
+            tracker.handle_time_jump(last_tick);
+        }
+        last_tick = tick_now;
+
         // Check for external pause/resume.
         let want_paused = paused_file.exists();
         if want_paused != tracker.paused {
